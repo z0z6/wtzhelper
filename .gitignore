@@ -1,0 +1,7 @@
+node_modules/
+dist/
+test/out-*
+test/*.pdf
+test/*.jpg
+*.log
+.DS_Store
