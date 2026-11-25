@@ -229,6 +229,7 @@ function buildAssessmentModel(a, ctx) {
   if (a.type === 'complex') field('Data przyjęcia do warsztatu', X.fmtDate(person.admission));
   const work = ws.filter((w) => !w.general);
   field(work.length > 1 ? 'Pracownie' : 'Pracownia', work.map((w) => w.name).join(', '));
+  field('Orzeczenie o niepełnosprawności', require('./documents').describeDisability(person.disability));
   field('Okres oceny', a.type === 'month' ? `${X.monthLabel(a.from)} (${X.fmtDate(a.from, false)} – ${X.fmtDate(a.to, false)})` : `${X.fmtDate(a.from, false)} – ${X.fmtDate(a.to, false)}`);
   const sc = settings.scale.map((s) => `${s.value} – ${s.label.toLowerCase()}`).join(', ');
   blocks.push({ kind: 'note', align: 'left', runs: [{ text: `Skala ocen cząstkowych (stopień opanowania umiejętności): ${sc}. Wynik procentowy = średnia ocen / 4.`, italic: true }] });

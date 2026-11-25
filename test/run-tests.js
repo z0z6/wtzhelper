@@ -19,6 +19,8 @@ const ollama = require('../src/main/ai/ollama');
 const { Accounts } = require('../src/main/accounts');
 const { anonymizer, findLeaks, polishAssessment, proposeConclusions, proposePlan, proposeProfile } = require('../src/main/ai/tasks');
 const imp = require('../src/main/import');
+const DOC = require('../src/main/documents');
+const { analyzeDocument } = require('../src/main/ai/tasks');
 
 let passed = 0;
 const t = (name, fn) => Promise.resolve().then(fn).then(() => { passed++; console.log('✓', name); }, (e) => { console.error('✗', name, '\n ', e.stack); process.exitCode = 1; });
@@ -269,6 +271,85 @@ function freshStore() { return new Store(fs.mkdtempSync(path.join(os.tmpdir(), '
     assert.deepStrictEqual(r.areas, [{ name: 'Obróbka', skills: ['Piłowanie', 'Szlifowanie'] }]);
     assert.deepStrictEqual(r.activities.map((a) => [a.name, a.skills]), [['Skrzynka', ['Piłowanie']]]);
     await assert.rejects(() => proposeProfile(prov, { name: '' }), /nazwę/);
+  });
+
+  // ───────────── dokumenty i skany ─────────────
+  const orz = fs.readFileSync(path.join(__dirname, 'fixtures', 'orzeczenie-wtz.txt'), 'utf8');
+
+  await t('Dokumenty: odczyt orzeczenia o stopniu niepełnosprawności (dane, stopień, symbole, ważność, wskazanie)', () => {
+    const r = DOC.parseDocument('orzeczenie', orz);
+    assert.deepStrictEqual(r.personal, { firstName: 'Jan', lastName: 'Kowalski', pesel: '90010712358', birthDate: '1990-01-07', gender: 'm', address: 'ul. Lipowa 3/4, 30-001 Kraków' });
+    assert.deepStrictEqual({ ...r.disability, notes: undefined }, { degree: 'znaczny', codes: ['01-U', '12-C'], number: 'PZON.8230.1234.2024', issued: '2024-03-12', validUntil: 'na stałe', therapy: 'wskazane', notes: undefined });
+    const ocr = 'ORZECZENIE O STOPNIU NIEPEŁNOSPRAWNOŚCI\nNazwisko i imię\nNOWAK ANNA MARIA\nzaliczona do umiarkowanego stopnia niepelnosprawnosci\nSymbol przyczyny: 02—P  05 -R\nOrzeczenie wydaje się na okres do dnia 31.03.2027 r.\nterapii zajęciowej: nie wymaga';
+    const r2 = DOC.parseDocument('orzeczenie', ocr);
+    assert.deepStrictEqual([r2.personal.firstName, r2.personal.lastName, r2.personal.gender], ['Anna Maria', 'Nowak', 'k']);
+    assert.deepStrictEqual([r2.disability.degree, r2.disability.codes, r2.disability.validUntil, r2.disability.therapy], ['umiarkowany', ['02-P', '05-R'], '2027-03-31', 'nie wskazane']);
+    assert.strictEqual(DOC.describeDisability(r.disability), 'stopień znaczny; 01-U (upośledzenie umysłowe), 12-C (całościowe zaburzenia rozwojowe)');
+    const ad = DOC.localAdaptations(r.disability);
+    assert(ad.some((a) => /piktogram/.test(a)) && ad.some((a) => /Praca indywidualna/.test(a)));
+    assert(DOC.needsSupervision({ disability: { codes: ['06-E'] } }) && !DOC.needsSupervision({ disability: { degree: 'umiarkowany', codes: ['01-U'] } }));
+  });
+
+  await t('Dokumenty: poprzedni arkusz ocen – poziomy umiejętności z profilu (cyfry i opisy), cele', () => {
+    const w = W('gospodarstwo');
+    const sheet = 'ARKUSZ OCENY – PRACOWNIA GOSPODARSTWA DOMOWEGO\nData oceny: 15.06.2025\nMycie i obieranie warzyw   3\nKrojenie i posługiwanie się nożem – z częściową pomocą\nObsługa czajnika elektrycznego: samodzielnie\nSegregacja odpadów 1\nCele na kolejny okres:\n- Samodzielne przygotowanie herbaty dla grupy\n- Bezpieczne posługiwanie się nożem przy krojeniu warzyw';
+    const r = DOC.parseDocument('ocena', sheet, { skills: PL.allSkills(w) });
+    assert.strictEqual(r.date, '2025-06-15');
+    assert.deepStrictEqual(r.levels.map((l) => [l.skillId, l.level]), [['gospodarstwo.mycie', 3], ['gospodarstwo.krojenie', 2], ['gospodarstwo.czajnik', 4], ['gospodarstwo.segregacja', 1]]);
+    assert.deepStrictEqual(r.goals, ['Samodzielne przygotowanie herbaty dla grupy', 'Bezpieczne posługiwanie się nożem przy krojeniu warzyw']);
+  });
+
+  await t('Dokumenty: pseudonimizacja i strażnik (odmiana, zdrobnienia, PESEL, adres, inne osoby)', () => {
+    const person = DOC.parsePersonal(orz);
+    const extra = [{ firstName: 'Ewa', lastName: 'Lewandowska' }];
+    const txt = orz + '\nKuba? Nie – Jana odwiedziła Ewa Lewandowska, tel. 600 100 200, jan@poczta.pl. Kowalskiemu pomaga mgr Zofia Wrona.';
+    const r = DOC.pseudonymize(txt, person, extra);
+    assert(!DOC.pseudonymize(orz, { ...person, disability: { number: 'PZON.8230.1234.2024' } }).text.includes('1234'), 'numer orzeczenia');
+    assert(!r.text.includes('PZON.8230'), 'znak sprawy');
+    for (const bad of ['Kowalski', 'Jana', 'Lewandowska', '90010712358', 'Lipowa', '600 100 200', 'jan@poczta.pl', 'Wrona', '12.03.2024', 'Adam Nowicki']) assert(!r.text.includes(bad), bad);
+    assert(r.text.includes('01-U, 12-C') && r.text.includes('znacznego stopnia'), 'treść merytoryczna zostaje');
+    assert.deepStrictEqual(DOC.findLeaks(r.text, person, extra), []);
+    assert.deepStrictEqual(DOC.findLeaks('Rozmowa z Kowalskim i Lewandowską.', person, extra).sort(), ['dane innej osoby', 'nazwisko']);
+    assert(DOC.findLeaks('PESEL 90010712358', person).includes('PESEL'));
+    assert.strictEqual(DOC.unmark('{{IMIE}} {{NAZWISKO}} kroi z pomocą, ur. {{DATA}}.'), 'uczestnik kroi z pomocą, ur. ….');
+  });
+
+  await t('AI: analiza dokumentu – walidacja wyniku, brak danych osobowych w zapytaniu', async () => {
+    const person = DOC.parsePersonal(orz);
+    const anon = DOC.pseudonymize(orz, person).text;
+    let seen = '';
+    const prov = { run: async ({ prompt }) => { seen = prompt; return { text: '```json\n' + JSON.stringify({
+      podsumowanie: '{{IMIE}} wymaga stałej pomocy.', stopien: 'Znaczny', symbole: ['01-U', '12 C', '99-X'],
+      mocne_strony: ['Samodzielne mycie'], trudnosci: ['- Przygotowanie posiłków'], dostosowania: ['Instrukcje obrazkowe', 'Plan dnia z piktogramami'],
+      cele_ipr: ['1. Samodzielne przygotowanie kanapki'],
+      oceny: [{ id: 'gospodarstwo.zimne', poziom: 1, uzasadnienie: 'stała pomoc przy posiłkach' }, { id: 'obca.umiejetnosc', poziom: 3 }, { id: 'ogolne.higiena', poziom: 7 }],
+      priorytety: ['gospodarstwo.zimne', 'x']
+    }) + '\n```' }; } };
+    const skills = [...PL.allSkills(W('gospodarstwo')), ...PL.allSkills(G)];
+    const r = await analyzeDocument(prov, { type: 'orzeczenie', text: anon, skills, scale: store.settings.scale, workshop: 'Pracownia gospodarstwa domowego', disability: 'stopień znaczny' });
+    assert(!/Kowalski|\bJan\b|90010712358|Lipowa/.test(seen), 'dane osobowe w zapytaniu');
+    assert(seen.includes('gospodarstwo.zimne') && seen.includes('01-U'));
+    assert.strictEqual(r.summary, 'Uczestnik wymaga stałej pomocy.');
+    assert.deepStrictEqual([r.degree, r.codes], ['znaczny', ['01-U', '12C'].filter((c) => c === '01-U')]);
+    assert.deepStrictEqual(r.difficulties, ['Przygotowanie posiłków']);
+    assert.deepStrictEqual(r.goals, ['Samodzielne przygotowanie kanapki']);
+    assert.deepStrictEqual(r.levels, [{ skillId: 'gospodarstwo.zimne', level: 1, reason: 'Stała pomoc przy posiłkach' }]);
+    assert.deepStrictEqual(r.priorities, ['gospodarstwo.zimne']);
+    await assert.rejects(() => analyzeDocument(prov, { type: 'ocena', text: ' ', skills, scale: store.settings.scale }), /Brak tekstu/);
+  });
+
+  await t('Plany: nadzór przy narzędziach dla uczestników z epilepsją / znacznym stopniem i tabela dostosowań', async () => {
+    const w = W('gospodarstwo');
+    const ewa = { id: 'p3', firstName: 'Ewa', lastName: 'Lis', gender: 'k', workshopId: 'gospodarstwo', disability: { degree: 'umiarkowany', codes: ['06-E'] }, adaptations: ['Nadzór przy kuchence.'] };
+    const ctx = PL.makeCtx({ workshop: w, general: G, participants: [ewa, anna], marks: [], settings: store.settings });
+    assert.deepStrictEqual(PL.individualFor(ctx, ['gospodarstwo.krojenie'], 'Sałatka'), [{ participantId: 'p3', supervision: true }]);
+    assert.deepStrictEqual(PL.individualFor(ctx, ['gospodarstwo.planowanie'], 'Planowanie jadłospisu'), []);
+    const plan = PL.generatePlan({ id: 'x', type: 'week', start: '2026-11-25', workshop: w, general: G, participants: [ewa, anna], marks: [], settings: store.settings, seed: 2 });
+    const m = PL.buildPlanModel(plan, { workshop: w, general: G, participants: [ewa, anna], settings: store.settings, scale: store.settings.scale });
+    const tbl = m.blocks.find((b) => b.kind === 'table' && b.cols[0].text === 'Uczestnik');
+    assert.deepStrictEqual(tbl.rows, [['Ewa L.', 'stopień umiarkowany; 06-E (epilepsja)', '– Nadzór przy kuchence.']]);
+    const html = renderHtml(m);
+    assert(html.includes('Dostosowania do rodzaju i stopnia niepełnosprawności') && html.includes('nadzór i asekuracja przy narzędziach'));
   });
 
   await t('extractJson radzi sobie z tekstem wokół JSON', () => {

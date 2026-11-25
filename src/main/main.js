@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme, safeStorage, protocol, session, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -9,7 +9,8 @@ const { Accounts } = require('./accounts');
 const { createProvider, providerChain, ACCOUNT_IDS, MODES, DEFS, findClaude } = require('./ai/providers');
 const cliTools = require('./ai/cli-tools');
 const ollama = require('./ai/ollama');
-const { polishAssessment, proposeConclusions, proposePlan, proposeProfile, findLeaks } = require('./ai/tasks');
+const { polishAssessment, proposeConclusions, proposePlan, proposeProfile, analyzeDocument, findLeaks } = require('./ai/tasks');
+const DOC = require('./documents');
 const X = require('./text');
 const PL = require('./planner');
 const AS = require('./assessment');
@@ -25,6 +26,32 @@ const portableDir = process.env.PORTABLE_EXECUTABLE_DIR;
 const dataDir = process.env.WTZ_DATA_DIR || (portableDir ? path.join(portableDir, 'WTZ Helper - dane') : path.join(app.getPath('userData'), 'dane'));
 
 if (!app.requestSingleInstanceLock()) app.quit();
+
+// Interfejs ładowany z własnego protokołu app:// (WASM i workery lokalnego OCR działają jak na stronie www).
+protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } }]);
+const RENDERER = path.join(__dirname, '..', 'renderer');
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.wasm': 'application/wasm', '.gz': 'application/gzip' };
+const scansDir = () => path.join(dataDir, 'skany');
+
+function registerAppProtocol() {
+  protocol.handle('app', async (req) => {
+    const u = new URL(req.url);
+    const rel = decodeURIComponent(u.pathname).replace(/^\/+/, '') || 'index.html';
+    const file = path.normalize(path.join(RENDERER, rel));
+    if (!file.startsWith(RENDERER)) return new Response('forbidden', { status: 403 });
+    try {
+      const buf = await fs.promises.readFile(file);
+      return new Response(buf, { headers: { 'content-type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream', 'cache-control': 'no-cache' } });
+    } catch (_) { return new Response('not found', { status: 404 }); }
+  });
+}
+
+// Okno aplikacji nie ma dostępu do internetu – tylko lokalne pliki. Skany dokumentów nie mogą wyjść z komputera;
+// połączenia z AI wykonuje wyłącznie proces główny, po kontroli strażnika prywatności.
+function lockDownNetwork() {
+  session.defaultSession.webRequest.onBeforeRequest((details, cb) => cb({ cancel: !/^(app|data|blob|devtools|file):/i.test(details.url) }));
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => cb(permission === 'clipboard-sanitized-write'));
+}
 
 let win = null;
 let store, accounts;
@@ -110,7 +137,7 @@ function createWindow() {
   });
   win.setMenuBarVisibility(false);
   try { win.webContents.session.setSpellCheckerLanguages(['pl']); } catch (_) { /* brak słownika */ }
-  win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  win.loadURL('app://local/index.html');
   win.once('ready-to-show', () => win.show());
   if (process.env.WTZ_SHOTS) {
     win.webContents.on('console-message', (...a) => { const e = a[0]; console.log('[renderer]', e && e.message ? e.message : a.slice(1).join(' ')); });
@@ -128,6 +155,7 @@ async function devScreenshots(dir) {
   fs.mkdirSync(dir, { recursive: true });
   const steps = (process.env.WTZ_STEPS || 'start').split(',');
   await wait(1500);
+  if (process.env.WTZ_TEST_FILE) await win.webContents.executeJavaScript(`window.__testB64=${JSON.stringify(fs.readFileSync(process.env.WTZ_TEST_FILE).toString('base64'))}`);
   for (const step of steps) {
     const i = step.indexOf('=');
     const name = i < 0 ? step : step.slice(0, i);
@@ -235,7 +263,7 @@ function handle(channel, fn) {
 }
 
 function registerIpc() {
-  handle('app:info', () => ({ version: app.getVersion(), platform: process.platform, dataDir, portable: !!portableDir, refStyles: Object.entries(X.REF_STYLES).map(([value, v]) => ({ value, label: v.label })), iprStatus: AS.IPR_STATUS, today: X.today() }));
+  handle('app:info', () => ({ version: app.getVersion(), platform: process.platform, dataDir, portable: !!portableDir, refStyles: Object.entries(X.REF_STYLES).map(([value, v]) => ({ value, label: v.label })), iprStatus: AS.IPR_STATUS, today: X.today(), codes: DOC.CODES, docTypes: DOC.DOC_TYPES, adapt: DOC.ADAPT, degreeAdapt: DOC.DEGREE_ADAPT }));
 
   handle('window:control', (action) => {
     if (!win) return false;
@@ -361,7 +389,11 @@ function registerIpc() {
     if (!p || !p.id) throw new Error('Nieprawidłowe dane uczestnika.');
     return store.put('participants', p);
   });
-  handle('participants:remove', (id) => { store.remove('participants', id); return true; });
+  handle('participants:remove', (id) => {
+    store.remove('participants', id);
+    try { fs.rmSync(path.join(scansDir(), path.basename(id)), { recursive: true, force: true }); } catch (_) { /* brak */ }
+    return true;
+  });
   handle('participants:importFile', async (workshopId) => {
     const r = await dialog.showOpenDialog(win, {
       title: 'Wybierz plik z listą uczestników',
@@ -401,7 +433,7 @@ function registerIpc() {
     if (!plan || !plan.id) throw new Error('Nieprawidłowe dane planu.');
     if (refresh) {
       const ctx = PL.makeCtx({ ...planCtx(plan), marks: store.data.marks, until: plan.to });
-      for (const d of plan.days) for (const b of d.blocks) if (b.kind === 'activity') b.individual = PL.individualFor(ctx, b.skills || []);
+      for (const d of plan.days) for (const b of d.blocks) if (b.kind === 'activity') b.individual = PL.individualFor(ctx, b.skills || [], b.title);
     }
     return store.put('plans', plan);
   });
@@ -476,7 +508,7 @@ function registerIpc() {
     const ipr = (c.person.iprGoals || []).filter((g) => g.text).map((g) => ({ text: g.text, status: ((AS.IPR_STATUS.find((x) => x.value === (a.ipr[g.id] || {}).status)) || {}).label }));
     const stance = a.type === 'complex' && a.stance ? ((store.settings.stances.find((s) => s.id === a.stance.option) || {}).label || '') : '';
     const chain = aiChain(c.person);
-    const r = await proposeConclusions(chain, { sections, person: c.person, refName: X.refName(c.person), type: a.type, ipr, stance, notes: a.notes });
+    const r = await proposeConclusions(chain, { sections, person: c.person, refName: X.refName(c.person), type: a.type, ipr, stance, notes: a.notes, disability: DOC.describeDisability(c.person.disability) });
     return { ...r, provider: chain.used.label };
   });
   handle('ai:plan', async (id) => {
@@ -485,7 +517,8 @@ function registerIpc() {
     const ctx = PL.makeCtx({ ...c, marks: store.data.marks, until: plan.to });
     const needs = PL.allSkills(c.workshop).map((s) => s).sort((x, y) => (ctx.need.get(y.id) || 3) - (ctx.need.get(x.id) || 3)).slice(0, 5).map((s) => s.name);
     const chain = aiChain(store.list('participants'));
-    const out = await proposePlan(chain, { workshop: c.workshop, general: c.general, plan, needs });
+    const group = c.participants.map((p, i) => { const d = DOC.describeDisability(p.disability); return d ? `uczestnik ${i + 1}: ${d}` : ''; }).filter(Boolean);
+    const out = await proposePlan(chain, { workshop: c.workshop, general: c.general, plan, needs, group });
     return { blocks: out, provider: chain.used.label };
   });
   handle('ai:profile', async ({ name, description }) => {
@@ -493,6 +526,102 @@ function registerIpc() {
     const r = await proposeProfile(chain, { name, description });
     return { ...r, provider: chain.used.label };
   });
+
+  // ── dokumenty uczestników (OCR w oknie, odczyt i pseudonimizacja tutaj) ──
+  // do pseudonimizacji: wszyscy uczestnicy (także ten, którego dotyczy dokument), terapeuci i prowadzący
+  const others = () => [...store.list('participants'), { name: store.settings.profile.name }, ...store.workshops.map((w) => ({ name: w.instructor }))];
+  const skillsFor = (p) => [store.workshop(p && p.workshopId), store.general()].filter(Boolean).flatMap((w) => PL.allSkills(w));
+  handle('clipboard:image', () => {
+    const img = clipboard.readImage();
+    if (!img || img.isEmpty()) throw new Error('W schowku nie ma obrazu. Zrób zrzut ekranu (np. Win+Shift+S lub PrtSc) i spróbuj ponownie.');
+    return img.toPNG().toString('base64');
+  });
+  handle('docs:parse', (type, text, participantId) => {
+    if (!DOC.DOC_TYPES[type]) throw new Error('Nieznany rodzaj dokumentu.');
+    const p = participantId ? must('participants', participantId) : null;
+    const workshop = p ? store.workshop(p.workshopId) : null;
+    const skills = p ? skillsFor(p) : PL.allSkills(store.general());
+    return { ...DOC.parseDocument(type, String(text || ''), { skills }), workshopId: workshop ? workshop.id : '' };
+  });
+  // person = dane z formularza (także dla nowego uczestnika); wynik = tekst dla AI + stan strażnika
+  handle('docs:anonymize', (text, person, participantId) => {
+    const r = DOC.pseudonymize(text, person, others(participantId));
+    return { ...r, leaks: DOC.findLeaks(r.text, person, others(participantId)) };
+  });
+  handle('docs:guard', (text, person, participantId) => DOC.findLeaks(text, person, others(participantId)));
+  // zapis dokumentu w karcie uczestnika (nowego albo istniejącego) + uzupełnienie danych
+  handle('docs:save', ({ participantId, personal, disability, doc, scans, overwrite }) => {
+    let p = participantId ? must('participants', participantId) : null;
+    if (!p) {
+      if (!personal || !personal.firstName || !personal.lastName) throw new Error('Uzupełnij imię i nazwisko uczestnika.');
+      p = { id: uid(), firstName: '', lastName: '', gender: 'm', birthDate: '', pesel: '', address: '', refStyle: 'imie', workshopId: personal.workshopId || '', admission: '', iprGoals: [], notes: '', active: true };
+    }
+    for (const k of ['firstName', 'lastName', 'gender', 'birthDate', 'pesel', 'address']) {
+      const v = personal && String(personal[k] || '').trim();
+      if (v && (overwrite || !p[k] || !participantId)) p[k] = v;
+    }
+    if (personal && personal.workshopId && (overwrite || !p.workshopId)) p.workshopId = personal.workshopId;
+    if (disability) {
+      const cur = p.disability || DOC.emptyDisability();
+      const d = { ...cur };
+      for (const k of ['degree', 'number', 'issued', 'validUntil', 'therapy']) if (disability[k] && (overwrite || !cur[k])) d[k] = disability[k];
+      if ((disability.codes || []).length && (overwrite || !(cur.codes || []).length)) d.codes = disability.codes;
+      p.disability = d;
+      if (!(p.adaptations || []).length) p.adaptations = DOC.localAdaptations(d);
+    }
+    const docId = uid();
+    const files = [];
+    if (Array.isArray(scans) && scans.length) {
+      const dir = path.join(scansDir(), path.basename(p.id));
+      fs.mkdirSync(dir, { recursive: true });
+      scans.forEach((b64, i) => { const f = `${docId}-${i + 1}.jpg`; fs.writeFileSync(path.join(dir, f), Buffer.from(String(b64), 'base64')); files.push(f); });
+    }
+    p.documents = p.documents || [];
+    if (doc) p.documents.unshift({ id: docId, type: doc.type, name: doc.name || DOC.DOC_TYPES[doc.type], date: doc.date || '', addedAt: new Date().toISOString(), text: doc.text || '', anonText: doc.anonText || '', scans: files, analysis: null });
+    store.put('participants', p);
+    return { participant: p, docId };
+  });
+  handle('docs:analyze', async (participantId, docId, anonText) => {
+    const p = must('participants', participantId);
+    const d = (p.documents || []).find((x) => x.id === docId);
+    if (!d) throw new Error('Nie znaleziono dokumentu.');
+    if (typeof anonText === 'string') d.anonText = anonText;
+    const leaks = DOC.findLeaks(d.anonText, p, others(p.id));
+    if (leaks.length) throw new Error(`Strażnik prywatności zablokował wysyłkę: w tekście dla AI zostały dane osobowe (${leaks.join(', ')}). Popraw tekst w podglądzie i spróbuj ponownie.`);
+    const w = store.workshop(p.workshopId);
+    const chain = aiChain([p, ...store.list('participants').filter((x) => x.id !== p.id)]);
+    const r = await analyzeDocument(chain, { type: d.type, text: d.anonText, skills: skillsFor(p), scale: store.settings.scale, workshop: w ? w.name : '', disability: DOC.describeDisability(p.disability) });
+    d.analysis = { ...r, provider: chain.used.label, at: new Date().toISOString() };
+    store.put('participants', p);
+    return d.analysis;
+  });
+  // przyjęcie wyników analizy: dostosowania, cele IPR, oceny wyjściowe, orzeczenie
+  handle('docs:apply', (participantId, { adaptations = [], goals = [], marks = [], date, disability }) => {
+    const p = must('participants', participantId);
+    p.adaptations = [...(p.adaptations || [])];
+    for (const a of adaptations) if (a && !p.adaptations.includes(a)) p.adaptations.push(a);
+    p.iprGoals = [...(p.iprGoals || [])];
+    for (const g of goals) if (g && !p.iprGoals.some((x) => x.text === g)) p.iprGoals.push({ id: 'c-' + uid().slice(0, 8), text: g });
+    if (disability) {
+      const cur = p.disability || DOC.emptyDisability();
+      p.disability = { ...cur, degree: cur.degree || disability.degree || '', codes: (cur.codes || []).length ? cur.codes : (disability.codes || []) };
+    }
+    store.put('participants', p);
+    let n = 0;
+    if (marks.length) {
+      if (!date) throw new Error('Podaj datę ocen wyjściowych.');
+      n = store.setMarks(marks.map((m) => ({ participantId: p.id, workshopId: p.workshopId || '', skillId: m.skillId, date, level: m.level })), uid);
+    }
+    return { participant: p, marks: n };
+  });
+  handle('docs:remove', (participantId, docId) => {
+    const p = must('participants', participantId);
+    const d = (p.documents || []).find((x) => x.id === docId);
+    for (const f of (d && d.scans) || []) { try { fs.unlinkSync(path.join(scansDir(), path.basename(p.id), path.basename(f))); } catch (_) { /* brak */ } }
+    p.documents = (p.documents || []).filter((x) => x.id !== docId);
+    return store.put('participants', p);
+  });
+  handle('docs:openScan', (participantId, file) => shell.openPath(path.join(scansDir(), path.basename(participantId), path.basename(file))));
 
   handle('shell:showFile', (p) => shell.showItemInFolder(p));
   handle('shell:openFile', (p) => shell.openPath(p));
@@ -502,6 +631,8 @@ function registerIpc() {
 app.on('second-instance', () => showWindow());
 
 app.whenReady().then(() => {
+  registerAppProtocol();
+  lockDownNetwork();
   store = new Store(dataDir);
   nativeTheme.themeSource = store.settings.ui.theme || 'system';
   cliTools.refreshPath();

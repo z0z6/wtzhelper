@@ -5,3 +5,4 @@ test/*.pdf
 test/*.jpg
 *.log
 .DS_Store
+src/renderer/vendor/

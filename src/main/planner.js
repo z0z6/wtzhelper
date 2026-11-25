@@ -5,6 +5,7 @@
 // pokrycie wszystkich umiejętności z profilu.
 
 const X = require('./text');
+const DOC = require('./documents');
 
 // ───────────── kalendarz ─────────────
 
@@ -124,18 +125,21 @@ function makeCtx({ workshop, general, participants = [], marks = [], settings, u
   return { workshop, general, participants, settings, levels, need: skillNeeds(ids, participants, levels), skills: skillMap(workshop, general) };
 }
 
-function individualFor(ctx, skills) {
+// Praca indywidualna: najsłabsza umiejętność uczestnika w danych zajęciach oraz – przy narzędziach ostrych,
+// gorących i maszynach – nadzór dla osób, których rodzaj lub stopień niepełnosprawności tego wymaga.
+function individualFor(ctx, skills, title) {
   if (!ctx.settings.planning || ctx.settings.planning.individual === false) return [];
+  const risky = DOC.isRisky(title, ...skills.map((s) => (ctx.skills.get(s) || {}).name));
   const out = [];
   for (const p of ctx.participants) {
     const lv = ctx.levels.get(p.id);
-    if (!lv) continue;
     let best = null;
-    for (const s of skills) {
+    if (lv) for (const s of skills) {
       const x = lv.get(s);
       if (x && x.level < 4 && (!best || x.level < best.level)) best = { skillId: s, level: x.level };
     }
-    if (best) out.push({ participantId: p.id, ...best });
+    const supervision = risky && DOC.needsSupervision(p);
+    if (best || supervision) out.push({ participantId: p.id, ...(best || {}), ...(supervision ? { supervision: true } : {}) });
   }
   return out;
 }
@@ -170,7 +174,7 @@ function fillDays(plan, dates, ctx, seed) {
       today.add(best.id);
       used.set(best.id, (used.get(best.id) || 0) + 1);
       for (const s of best.skills) covered.set(s, (covered.get(s) || 0) + 1);
-      return { ...base, activityId: best.id, title: best.name, goal: best.goal || '', methods: best.methods || '', materials: best.materials || '', skills: [...best.skills], individual: slot.kind === 'activity' ? individualFor(ctx, best.skills) : [] };
+      return { ...base, activityId: best.id, title: best.name, goal: best.goal || '', methods: best.methods || '', materials: best.materials || '', skills: [...best.skills], individual: slot.kind === 'activity' ? individualFor(ctx, best.skills, best.name) : [] };
     });
     yesterday = today;
     newDays.push({ date, blocks, note: '' });
@@ -270,7 +274,21 @@ function buildPlanModel(plan, { workshop, general, participants, settings, scale
   }
 
   const lvl = (v) => (scale[v] ? scale[v].label.toLowerCase() : '');
-  const indiv = (b) => (b.individual || []).map((x) => { const pp = byId.get(x.participantId); return pp && sname(x.skillId) ? `${X.shortName(pp)}: ${X.lower(sname(x.skillId))} (obecnie: ${lvl(x.level)})` : ''; }).filter(Boolean).join('\n');
+  // dostosowania do rodzaju i stopnia niepełnosprawności uczestników grupy
+  const adaptRows = people.filter((pp) => (pp.disability && (pp.disability.degree || (pp.disability.codes || []).length)) || (pp.adaptations || []).length)
+    .map((pp) => [X.shortName(pp), DOC.describeDisability(pp.disability) || '—', (pp.adaptations && pp.adaptations.length ? pp.adaptations : DOC.localAdaptations(pp.disability)).map((a) => '– ' + a).join('\n')]);
+  if (adaptRows.length) {
+    heading('Dostosowania do rodzaju i stopnia niepełnosprawności uczestników');
+    blocks.push({ kind: 'table', small: true, cols: [{ text: 'Uczestnik', w: 14 }, { text: 'Orzeczenie', w: 26 }, { text: 'Dostosowania form i metod pracy', w: 60 }], rows: adaptRows });
+  }
+  const indiv = (b) => (b.individual || []).map((x) => {
+    const pp = byId.get(x.participantId);
+    if (!pp) return '';
+    const parts = [];
+    if (x.skillId && sname(x.skillId)) parts.push(`${X.lower(sname(x.skillId))} (obecnie: ${lvl(x.level)})`);
+    if (x.supervision) parts.push('nadzór i asekuracja przy narzędziach');
+    return parts.length ? `${X.shortName(pp)}: ${parts.join('; ')}` : '';
+  }).filter(Boolean).join('\n');
   const showIndiv = plan.days.some((d) => d.blocks.some((b) => (b.individual || []).length));
   const dayTable = (d) => {
     const cols = [{ text: 'Godz.', w: 9 }, { text: 'Zajęcia', w: 26 }, { text: 'Cel i rozwijane umiejętności', w: 30 }, { text: 'Metody, formy i materiały', w: 20 }];

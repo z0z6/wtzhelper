@@ -1,5 +1,5 @@
 'use strict';
-/* global UI, icon, api, h, iconEl, toast, sheet, toggle, segmented, select, spinner, group, row, busy, settingsAi, refreshAccounts, refreshLocal, bindAiEvents, ACCOUNTS */
+/* global UI, icon, api, h, iconEl, toast, sheet, toggle, segmented, select, spinner, group, row, busy, settingsAi, refreshAccounts, refreshLocal, bindAiEvents, ACCOUNTS, viewDocs, openDocs, participantDisabilitySection, participantDocsSection, describeDis */
 
 const state = {
   info: null, settings: null, hasApiKey: false, claudePath: null,
@@ -9,7 +9,7 @@ const state = {
   assess: null, stats: null,
   marks: { workshopId: null, date: null, mode: 'plan' },
   planFilter: '', assessFilter: 'all', peopleFilter: '',
-  wsId: null, openDays: {},
+  wsId: null, openDays: {}, doc: null,
   settingsTab: 'general',
   accounts: {}, acc: {}, local: { status: null, pulling: null, installing: false, log: '' }, aiView: null, aiAdvanced: false
 };
@@ -139,6 +139,7 @@ function renderSidebar() {
   ];
   const data = [
     ['participants', 'people', 'Uczestnicy', state.participants.length || null],
+    ['docs', 'scan', 'Dokumenty i skany'],
     ['workshops', 'home', 'Pracownie', workWorkshops().length || null]
   ];
   const ai = state.settings.ai;
@@ -170,11 +171,11 @@ function renderSidebar() {
 function render() {
   renderSidebar();
   const c = document.getElementById('content');
-  const views = { plans: viewPlans, plan: viewPlan, marks: viewMarks, assessments: viewAssessments, assess: viewAssess, participants: viewParticipants, workshops: viewWorkshops, settings: viewSettings };
+  const views = { plans: viewPlans, plan: viewPlan, marks: viewMarks, assessments: viewAssessments, assess: viewAssess, participants: viewParticipants, workshops: viewWorkshops, settings: viewSettings, docs: viewDocs };
   const el = views[state.view]();
   el.classList.add('fade-in');
   c.replaceChildren(el);
-  const title = { plans: 'Plany pracy', plan: 'Plan pracy', marks: 'Oceny cząstkowe', assessments: 'Oceny okresowe', assess: 'Ocena', participants: 'Uczestnicy', workshops: 'Pracownie', settings: 'Ustawienia' }[state.view];
+  const title = { plans: 'Plany pracy', plan: 'Plan pracy', marks: 'Oceny cząstkowe', assessments: 'Oceny okresowe', assess: 'Ocena', participants: 'Uczestnicy', workshops: 'Pracownie', settings: 'Ustawienia', docs: 'Dokumenty i skany' }[state.view];
   document.getElementById('window-title').textContent = title + ' — WTZ Helper';
 }
 
@@ -299,7 +300,8 @@ function viewPlan() {
       h('input', { class: 'input full', value: wk.theme || '', oninput: (e) => { wk.theme = e.target.value; touchPlan(); } }))))) : null,
     field({ day: 'Cele dnia', week: 'Cele tygodnia', month: 'Cele miesiąca' }[plan.type] + ' (każdy w osobnej linii)', T('goals', 2)),
     field('Uwagi (trafiają na koniec dokumentu)', T('notes', 1, 'np. wyjście do sklepu w środę, zajęcia z udziałem rodziców…')),
-    h('div', { class: 'people-line' }, h('span', { class: 'muted small' }, people.length ? 'Uczestnicy: ' : 'Brak uczestników przypisanych do pracowni.'), people.map((p) => h('span', { class: 'chip person' }, shortName(p)))));
+    h('div', { class: 'people-line' }, h('span', { class: 'muted small' }, people.length ? 'Uczestnicy: ' : 'Brak uczestników przypisanych do pracowni.'), people.map((p) => h('span', { class: 'chip person', title: describeDis(p.disability) || 'brak danych z orzeczenia' }, shortName(p), p.disability && p.disability.codes && p.disability.codes.length ? ` · ${p.disability.codes.join(', ')}` : ''))),
+    people.some((p) => (p.adaptations || []).length || (p.disability && (p.disability.degree || (p.disability.codes || []).length))) ? h('div', { class: 'muted small', style: { marginTop: '6px' } }, iconEl('info', 12), ' Dostosowania do rodzaju i stopnia niepełnosprawności uczestników trafią do dokumentu planu (tabela) i do zapytania „Dobierz z AI”. Uzupełnisz je w karcie uczestnika lub z dokumentów.') : null);
 
   const ok = !state.planProblems.length;
   const banner = h('div', { class: 'note-box' + (ok ? ' ok' : ' warn') }, iconEl(ok ? 'checkCircle' : 'warn', 16),
@@ -357,7 +359,12 @@ function blockRow(b, w, g) {
     try { await savePlanSoon.flush(); state.plan = await api.savePlan(state.plan, true); rerenderKeep(); } catch (e) { errToast(e); }
   }, { class: 'input full' });
   const inp = (key, ph) => h('input', { class: 'input full', value: b[key] || '', placeholder: ph, oninput: (e) => { b[key] = e.target.value; touchPlan(); } });
-  const indiv = (b.individual || []).map((x) => { const p = state.participants.find((pp) => pp.id === x.participantId); return p && skills.get(x.skillId) ? h('span', { class: 'chip', title: `${skills.get(x.skillId)} – obecnie: ${scaleLabel(x.level).toLowerCase()}` }, `${shortName(p)}: ${skills.get(x.skillId)} (${x.level})`) : null; }).filter(Boolean);
+  const indiv = (b.individual || []).map((x) => {
+    const p = state.participants.find((pp) => pp.id === x.participantId);
+    if (!p) return null;
+    const txt = [x.skillId && skills.get(x.skillId) ? `${skills.get(x.skillId)} (${x.level})` : '', x.supervision ? 'nadzór przy narzędziach' : ''].filter(Boolean).join(' · ');
+    return txt ? h('span', { class: 'chip' + (x.supervision ? ' warn' : ''), title: x.supervision ? 'Rodzaj lub stopień niepełnosprawności wymaga nadzoru przy narzędziach ostrych, gorących i maszynach' : `obecnie: ${scaleLabel(x.level).toLowerCase()}` }, `${shortName(p)}: ${txt}`) : null;
+  }).filter(Boolean);
   wrap.append(time, h('div', { class: 'block-main' },
     h('div', { class: 'block-top' }, h('span', { class: 'chip ' + (b.kind === 'activity' ? 'blue' : 'teal') }, b.kind === 'activity' ? 'pracownia' : 'ogólne'), pick),
     field('Tytuł zajęć w planie', inp('title')),
@@ -711,16 +718,18 @@ function viewParticipants() {
   let body;
   if (!state.participants.length) body = emptyState('people', 'Dodaj uczestników warsztatu', 'Każdy uczestnik jest przypisany do pracowni. Na podstawie jego ocen cząstkowych plany uwzględniają pracę indywidualną, a oceny okresowe opisują postępy.', h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'center' } }, h('button', { class: 'btn primary lg', onclick: () => editParticipant(null) }, iconEl('plus', 15), 'Dodaj uczestnika'), h('button', { class: 'btn lg', onclick: importSheet }, iconEl('upload', 15), 'Importuj z pliku')));
   else body = h('div', { class: 'card', style: { overflow: 'hidden' } }, h('table', { class: 'tbl list' },
-    h('thead', null, h('tr', null, h('th', null, `Uczestnik (${list.length})`), h('th', null, 'Pracownia'), h('th', null, 'Data przyjęcia'), h('th', null, 'Cele IPR'), h('th', null, ''))),
+    h('thead', null, h('tr', null, h('th', null, `Uczestnik (${list.length})`), h('th', null, 'Pracownia'), h('th', null, 'Orzeczenie'), h('th', null, 'Data przyjęcia'), h('th', null, 'Cele IPR'), h('th', null, ''))),
     h('tbody', null, list.map((p) => h('tr', { class: 'clickable' + (p.active === false ? ' off' : ''), onclick: () => editParticipant(p) },
       h('td', null, h('div', { class: 'who' }, h('span', { class: 'avatar' }, (p.lastName || '?').charAt(0)), h('b', null, `${p.lastName} ${p.firstName}`), p.active === false ? h('span', { class: 'chip' }, 'nieaktywny') : null)),
       h('td', null, wsById(p.workshopId) ? wsById(p.workshopId).name : h('span', { class: 'muted' }, '— nieprzypisany —')),
+      h('td', { class: 'muted small' }, describeDis(p.disability) || '—'),
       h('td', { class: 'muted' }, fmtDate(p.admission)),
       h('td', null, (p.iprGoals || []).length || '—'),
       h('td', { style: { textAlign: 'right' } }, h('button', { class: 'icon-btn', title: 'Usuń', onclick: (e) => { e.stopPropagation(); sheet({ title: 'Usunąć uczestnika?', body: h('p', null, `${fullName(p)} zostanie usunięty z aplikacji razem z ocenami cząstkowymi i ocenami okresowymi. Zamiast tego możesz oznaczyć uczestnika jako nieaktywnego.`), actions: [{ label: 'Anuluj' }, { label: 'Usuń', kind: 'danger', onClick: async () => { await api.removeParticipant(p.id); await reloadData(); render(); } }] }); }, html: icon('trash', 15) })))))));
   return h('div', null,
     h('div', { class: 'toolbar' }, h('h1', null, 'Uczestnicy'), h('div', { class: 'spacer' }),
       state.participants.length ? select([{ value: '', label: 'Wszystkie pracownie' }, ...ws.map((w) => ({ value: w.id, label: w.name }))], state.peopleFilter, (v) => { state.peopleFilter = v; render(); }) : null,
+      h('button', { class: 'btn', onclick: () => openDocs('') }, iconEl('scan', 14), 'Z dokumentu'),
       h('button', { class: 'btn', onclick: importSheet }, iconEl('upload', 14), 'Importuj'),
       h('button', { class: 'btn primary', onclick: () => editParticipant(null) }, iconEl('plus', 14), 'Dodaj uczestnika')),
     h('div', { class: 'page' }, body,
@@ -740,7 +749,8 @@ function editParticipant(p) {
   drawGoals();
   const progress = h('div', null);
   if (!isNew) loadProgress(d, progress);
-  sheet({
+  let sh;
+  sh = sheet({
     title: isNew ? 'Nowy uczestnik' : fullName(d), wide: true,
     body: h('div', null,
       h('div', { class: 'form-grid' },
@@ -751,13 +761,20 @@ function editParticipant(p) {
         field('Pracownia', select([{ value: '', label: '— nieprzypisany —' }, ...workWorkshops().map((w) => ({ value: w.id, label: w.name }))], d.workshopId || '', (v) => { d.workshopId = v; }, { style: 'width:100%' })),
         field('W opisach nazywaj osobę', select(state.info.refStyles, d.refStyle || 'imie', (v) => { d.refStyle = v; }, { style: 'width:100%' })),
         field('Status', h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: d.active !== false, onchange: (e) => { d.active = e.target.checked; } }), 'aktywny uczestnik'))),
+      h('h3', { class: 'group-title', style: { marginTop: '14px' } }, 'Orzeczenie i dostosowania'),
+      participantDisabilitySection(d),
       field('Cele indywidualnego programu rehabilitacji (IPR)', goals),
+      !isNew ? field('Dokumenty (orzeczenia, poprzednie oceny, IPR) – skany zostają na tym komputerze', participantDocsSection(d, () => sh.close())) : null,
       field('Notatki', autoGrow(h('textarea', { class: 'input', rows: 2, value: d.notes || '', oninput: (e) => { d.notes = e.target.value; } }))),
       progress),
     actions: [{ label: 'Anuluj' }, { label: 'Zapisz', kind: 'primary', onClick: async () => {
       if (!d.firstName.trim() || !d.lastName.trim()) { toast('Podaj imię i nazwisko', 'error'); return false; }
       d.firstName = d.firstName.trim(); d.lastName = d.lastName.trim(); d.iprGoals = d.iprGoals.filter((g) => String(g.text || '').trim());
-      try { await api.saveParticipant(d); state.participants = await api.listParticipants(); render(); toast('Zapisano', 'success', 1500); } catch (e) { errToast(e); return false; }
+      try {
+        const cur = state.participants.find((x) => x.id === d.id);
+        if (cur) d.documents = cur.documents; // dokumenty zmieniane są osobno (dodawanie, analiza, usuwanie)
+        await api.saveParticipant(d); state.participants = await api.listParticipants(); render(); toast('Zapisano', 'success', 1500);
+      } catch (e) { errToast(e); return false; }
     } }]
   });
 }

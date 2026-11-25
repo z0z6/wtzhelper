@@ -5,7 +5,8 @@ Aplikacja desktopowa (Windows, Linux) dla terapeutów zajęciowych i instruktor�
 - **plany pracy** pracowni – dzienne, tygodniowe i miesięczne,
 - **oceny cząstkowe** – stopień opanowania umiejętności w danym dniu (skala 0–4),
 - **oceny okresowe** – miesięczne i roczne (okresowa ocena realizacji IPR),
-- **oceny kompleksowe** realizacji IPR – ze stanowiskiem rady programowej.
+- **oceny kompleksowe** realizacji IPR – ze stanowiskiem rady programowej,
+- **dokumenty i skany** – zdjęcia, zrzuty ekranu i PDF-y orzeczeń, poprzednich arkuszy ocen, IPR i opinii, odczytywane na komputerze i (opcjonalnie) analizowane przez agenta AI.
 
 Dokumenty zapisuje jako **DOCX** i **PDF**. Wszystkie dane zostają na komputerze. AI jest opcjonalne.
 
@@ -51,6 +52,35 @@ Profile można dowolnie zmieniać, dodawać nowe i zapisywać do pliku JSON (*Pr
 - Teksty ze skali, zdania o zmianach i treść stanowisk ustawia się w *Ustawienia → Skala i opisy*.
 - Twoje poprawki w opisach zostają po przeliczeniu ocen. Przycisk *Przywróć z ocen* odtwarza opis automatyczny.
 
+## Dokumenty i skany
+
+Zakładka *Dokumenty i skany* (albo *Uczestnicy → Z dokumentu*, albo przycisk w karcie uczestnika):
+
+1. Wrzucasz zdjęcie, skan lub PDF (przeciągnij, *Wybierz pliki*, **Ctrl+V / Wklej zrzut ekranu**) albo wklejasz sam tekst. Rodzaj dokumentu: orzeczenie, arkusz ocen, IPR, inny.
+2. **Odczyt tekstu (OCR) działa na komputerze** – Tesseract z językiem polskim i pdf.js. Obrazy nigdy nie są wysyłane; okno aplikacji nie ma dostępu do internetu.
+3. Aplikacja sama odczytuje:
+   - dane osobowe: imię i nazwisko, PESEL (z kontrolą sumy, datą urodzenia i płcią), adres,
+   - z orzeczenia: stopień niepełnosprawności, symbole przyczyny (01-U … 12-C), numer, datę wydania, ważność, wskazanie do terapii zajęciowej,
+   - z poprzednich arkuszy ocen: poziomy umiejętności z profilu pracowni (cyfry 0–4 albo opisy typu „samodzielnie”, „z częściową pomocą”) i cele.
+4. Sprawdzasz dane i zapisujesz je w karcie uczestnika – nowego albo istniejącego (domyślnie uzupełniane są tylko puste pola). Skan zostaje w folderze danych.
+5. Opcjonalnie **Zapisz i analizuj z AI** – agent dostaje wyłącznie tekst po pseudonimizacji. Imiona (także odmienione i zdrobnienia), nazwiska, PESEL, daty, adresy, telefony, e-maile, numery dokumentów i nazwiska innych osób są zamienione na znaczniki. Strażnik sprawdza tekst przed wysyłką. Agent proponuje:
+   - obraz funkcjonowania, mocne strony i trudności,
+   - **dostosowania do rodzaju i stopnia niepełnosprawności**,
+   - cele IPR,
+   - **oceny wyjściowe** umiejętności z profilu pracowni,
+   - priorytety.
+   Przyjmujesz tylko to, co zaznaczysz.
+
+Karta uczestnika ma sekcję *Orzeczenie i dostosowania* z bazą wiedzy: dostosowania form i metod pracy dla każdego symbolu i stopnia, do uzupełnienia jednym kliknięciem.
+
+W planach:
+
+- **tabela dostosowań** uczestników grupy,
+- przy zajęciach z narzędziami ostrymi, gorącymi lub maszynami – **nadzór i asekuracja** dla osób z epilepsją, chorobami narządu wzroku, ruchu, neurologicznymi lub znacznym stopniem niepełnosprawności,
+- *Dobierz z AI* uwzględnia rodzaj i stopień niepełnosprawności grupy (bez danych osobowych).
+
+Oceny pokazują orzeczenie w nagłówku, a AI uwzględnia je w podsumowaniu.
+
 ## AI i prywatność
 
 Sposób pracy wybiera się w *Ustawienia → AI*:
@@ -91,6 +121,8 @@ Struktura:
 - `assessment.js` – oceny,
 - `render.js` – DOCX i HTML/PDF (z tabelami i orientacją poziomą),
 - `ai/` – tryby AI (wspólne z aplikacją Skryba),
+- `documents.js` – odczyt orzeczeń i arkuszy ocen, pseudonimizacja, baza dostosowań,
+- `src/renderer/ocr.js` i `docs.js` – lokalny OCR i widok dokumentów (biblioteki kopiuje `scripts/copy-vendor.js` przy `npm install`),
 - `ai/tasks.js` – zadania AI i strażnik prywatności.
 
 Zrzuty ekranu w trybie deweloperskim:
